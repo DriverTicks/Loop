@@ -16,8 +16,6 @@ public enum RemoteCommandError: Error {
 
 
 enum RemoteCommand {
-    typealias RawValue = [String: Any]
-
     case temporaryScheduleOverride(TemporaryScheduleOverride)
     case cancelTemporaryOverride
     case bolusEntry(Double)
@@ -27,6 +25,7 @@ enum RemoteCommand {
 
 // Push Notifications
 extension RemoteCommand {
+
     init?(notification: [String: Any], allowedPresets: [TemporaryScheduleOverridePreset], otp: String) {
         
         // check OTP
@@ -56,6 +55,9 @@ extension RemoteCommand {
         
         if let overrideEnactName = notification["override-name"] as? String,
             let preset = allowedPresets.first(where: { $0.name == overrideEnactName }),
+
+      
+
             let remoteAddress = notification["remote-address"] as? String
         {
             var override = preset.createOverride(enactTrigger: .remote(remoteAddress))
@@ -65,6 +67,7 @@ extension RemoteCommand {
             self = .temporaryScheduleOverride(override)
         } else if let _ = notification["cancel-temporary-override"] as? String {
             self = .cancelTemporaryOverride
+
         }  else if let bolusValue = notification["bolus-entry"] as? Double {
             if !checkOTP() { return nil }
             self = .bolusEntry(bolusValue)
@@ -80,6 +83,7 @@ extension RemoteCommand {
             self = .carbsEntry(newEntry)
         }
         else {
+
             return nil
         }
     }
