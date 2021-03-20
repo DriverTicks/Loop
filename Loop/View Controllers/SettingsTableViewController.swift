@@ -12,7 +12,9 @@ import LoopKit
 import LoopKitUI
 import LoopCore
 import LoopTestingKit
+
 import LocalAuthentication
+import Combine
 
 final class SettingsTableViewController: UITableViewController {
 
@@ -38,6 +40,10 @@ final class SettingsTableViewController: UITableViewController {
 
     var dataManager: DeviceDataManager!
 
+    private lazy var importExportManager: ImportExportManager = {
+        BaseImportExportManager(rootController: self, dataManager: self.dataManager)
+    }()
+
     private lazy var isTestingPumpManager = dataManager.pumpManager is TestingPumpManager
     private lazy var isTestingCGMManager = dataManager.cgmManager is TestingCGMManager
 
@@ -47,14 +53,19 @@ final class SettingsTableViewController: UITableViewController {
         case cgm
         case configuration
         case services
+        case exportImportSettings
         case testingPumpDataDeletion
         case testingCGMDataDeletion
     }
 
     fileprivate enum LoopRow: Int, CaseCountable {
         case dosing = 0
+        case microbolus
         case diagnostic
+
         case otp
+        case freeAPSSettings
+
     }
 
     fileprivate enum PumpRow: Int, CaseCountable {
@@ -81,6 +92,11 @@ final class SettingsTableViewController: UITableViewController {
         case amplitude
     }
 
+    fileprivate enum ExportImportRow: Int, CaseCountable {
+        case export = 0
+        case `import`
+    }
+
     fileprivate lazy var valueNumberFormatter: NumberFormatter = {
         let formatter = NumberFormatter()
 
@@ -90,6 +106,9 @@ final class SettingsTableViewController: UITableViewController {
 
         return formatter
     }()
+
+    private var microbolusCancellable: AnyCancellable?
+    private var freeAPSSettingsCancellable: AnyCancellable?
 
     override func prepare(for segue: UIStoryboardSegue, sender: Any?) {
         switch segue.destination {
@@ -106,7 +125,7 @@ final class SettingsTableViewController: UITableViewController {
             break
         }
     }
-    
+
     func configuredSetupViewController(for pumpManager: PumpManagerUI.Type) -> (UIViewController & PumpManagerSetupViewController & CompletionNotifying) {
         var setupViewController = pumpManager.setupViewController()
         setupViewController.setupDelegate = self
@@ -116,7 +135,7 @@ final class SettingsTableViewController: UITableViewController {
         setupViewController.maxBasalRateUnitsPerHour = dataManager.loopManager.settings.maximumBasalRatePerHour
         return setupViewController
     }
-    
+
     // MARK: - UITableViewDataSource
 
     private var sections: [Section] {
@@ -146,6 +165,8 @@ final class SettingsTableViewController: UITableViewController {
             return ConfigurationRow.count
         case .services:
             return ServiceRow.count
+        case .exportImportSettings:
+            return ExportImportRow.count
         case .testingPumpDataDeletion, .testingCGMDataDeletion:
             return 1
         }
@@ -165,6 +186,26 @@ final class SettingsTableViewController: UITableViewController {
                 switchCell.switch?.addTarget(self, action: #selector(dosingEnabledChanged(_:)), for: .valueChanged)
 
                 return switchCell
+            case .microbolus:
+                let cell = tableView.dequeueReusableCell(withIdentifier: SettingsTableViewCell.className, for: indexPath)
+
+                cell.textLabel?.text = NSLocalizedString("Microboluses", comment: "The title text for the Microboluses cell")
+                let settings = dataManager.loopManager.settings
+                cell.detailTextLabel?.text = {
+                    guard settings.dosingEnabled else {
+                        return NSLocalizedString("Disabled", comment: "")
+                    }
+                    switch (settings.microbolusSettings.enabledWithoutCarbs, settings.microbolusSettings.enabled) {
+                    case (true, true): return NSLocalizedString("Always", comment: "")
+                    case (false, true): return NSLocalizedString("With Carbs", comment: "")
+                    case (true, false): return NSLocalizedString("Without Carbs", comment: "")
+                    default: return NSLocalizedString("Disabled", comment: "")
+                    }
+                }()
+                cell.accessoryType = .disclosureIndicator
+
+                return cell
+
             case .diagnostic:
                 let cell = tableView.dequeueReusableCell(withIdentifier: SettingsTableViewCell.className, for: indexPath)
 
@@ -173,6 +214,7 @@ final class SettingsTableViewController: UITableViewController {
                 cell.accessoryType = .disclosureIndicator
 
                 return cell
+
                 case .otp:
                     let cell = tableView.dequeueReusableCell(withIdentifier: SettingsTableViewCell.className, for: indexPath)
 
@@ -181,6 +223,15 @@ final class SettingsTableViewController: UITableViewController {
                     cell.accessoryType = .disclosureIndicator
 
                     return cell
+
+            case .freeAPSSettings:
+                let cell = tableView.dequeueReusableCell(withIdentifier: SettingsTableViewCell.className, for: indexPath)
+
+                cell.textLabel?.text = NSLocalizedString("Other FreeAPS settings", comment: "The title text for the Microboluses cell")
+                cell.accessoryType = .disclosureIndicator
+
+                return cell
+
             }
         case .pump:
             switch PumpRow(rawValue: indexPath.row)! {
@@ -259,7 +310,7 @@ final class SettingsTableViewController: UITableViewController {
                 }
             case .suspendThreshold:
                 configCell.textLabel?.text = NSLocalizedString("Suspend Threshold", comment: "The title text in settings")
-                
+
                 if let suspendThreshold = dataManager.loopManager.settings.suspendThreshold {
                     let value = valueNumberFormatter.string(from: suspendThreshold.value, unit: suspendThreshold.unit) ?? SettingsTableViewCell.TapToSetString
                     configCell.detailTextLabel?.text = value
@@ -317,6 +368,19 @@ final class SettingsTableViewController: UITableViewController {
 
             configCell.accessoryType = .disclosureIndicator
             return configCell
+        case .exportImportSettings:
+            switch ExportImportRow(rawValue: indexPath.row)! {
+            case .export:
+                let cell = tableView.dequeueReusableCell(withIdentifier: TextButtonTableViewCell.className, for: indexPath) as! TextButtonTableViewCell
+                cell.textLabel?.text = NSLocalizedString("Export Settings", comment: "")
+                cell.isEnabled = true
+                return cell
+            case .import:
+                let cell = tableView.dequeueReusableCell(withIdentifier: TextButtonTableViewCell.className, for: indexPath) as! TextButtonTableViewCell
+                cell.textLabel?.text = NSLocalizedString("Import Settings", comment: "")
+                cell.isEnabled = true
+                return cell
+            }
         case .testingPumpDataDeletion:
             let cell = tableView.dequeueReusableCell(withIdentifier: TextButtonTableViewCell.className, for: indexPath) as! TextButtonTableViewCell
             cell.textLabel?.text = "Delete Pump Data"
@@ -337,7 +401,7 @@ final class SettingsTableViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
         switch sections[section] {
         case .loop:
-            return Bundle.main.localizedNameAndVersion
+            return Bundle.main.localizedNameAndVersionAndBuild
         case .pump:
             return NSLocalizedString("Pump", comment: "The title of the pump section in settings")
         case .cgm:
@@ -346,7 +410,7 @@ final class SettingsTableViewController: UITableViewController {
             return NSLocalizedString("Configuration", comment: "The title of the configuration section in settings")
         case .services:
             return NSLocalizedString("Services", comment: "The title of the services section in settings")
-        case .testingPumpDataDeletion, .testingCGMDataDeletion:
+        case .exportImportSettings, .testingPumpDataDeletion, .testingCGMDataDeletion:
             return nil
         }
     }
@@ -565,6 +629,53 @@ final class SettingsTableViewController: UITableViewController {
                 vc.title = sender?.textLabel?.text
 
                 show(vc, sender: sender)
+            case .microbolus:
+                var settings = dataManager.loopManager.settings
+                guard settings.dosingEnabled,
+                    let unit = dataManager.loopManager.glucoseStore.preferredUnit
+                else { break }
+
+                let viewModel = MicrobolusView.ViewModel(
+                    settings: settings.microbolusSettings,
+                    glucoseUnit: unit,
+                    eventPublisher: dataManager.loopManager.lastMicrobolusEvent.eraseToAnyPublisher()
+                )
+
+                microbolusCancellable = viewModel.changes()
+                    .receive(on: DispatchQueue.main)
+                    .sink { [weak self] result in
+                        guard let self = self else { return }
+                        settings.microbolusSettings = result
+                        self.dataManager.loopManager.settings = settings
+                        self.tableView.reloadRows(at: [indexPath], with: .none)
+                }
+
+                let vc = MicrobolusViewController(viewModel: viewModel)
+                vc.onDeinit = {
+                    self.microbolusCancellable?.cancel()
+                }
+
+                show(vc, sender: sender)
+            case .freeAPSSettings:
+                var settings = dataManager.loopManager.settings
+
+                let viewModel = FreeAPSSettingsView.ViewModel(settings: settings.freeAPSSettings)
+
+                freeAPSSettingsCancellable = viewModel.changes()
+                    .receive(on: DispatchQueue.main)
+                    .sink { [weak self] result in
+                        guard let self = self else { return }
+                        settings.freeAPSSettings = result
+                        self.dataManager.loopManager.settings = settings
+                        self.tableView.reloadRows(at: [indexPath], with: .none)
+                }
+
+                let vc = FreeAPSSettingsViewController(viewModel: viewModel)
+                vc.onDeinit = {
+                    self.freeAPSSettingsCancellable?.cancel()
+                }
+
+                show(vc, sender: sender)
             case .dosing:
                 break
             case .otp:
@@ -616,6 +727,13 @@ final class SettingsTableViewController: UITableViewController {
 
                 show(vc, sender: sender)
             }
+        case .exportImportSettings:
+            switch ExportImportRow(rawValue: indexPath.row)! {
+            case .export:
+                importExportManager.exportSettings()
+            case .import:
+                importExportManager.importSettings()
+            }
         case .testingPumpDataDeletion:
             let confirmVC = UIAlertController(pumpDataDeletionHandler: { self.dataManager.deleteTestingPumpData() })
             present(confirmVC, animated: true) {
@@ -631,6 +749,13 @@ final class SettingsTableViewController: UITableViewController {
 
     @objc private func dosingEnabledChanged(_ sender: UISwitch) {
         dataManager.loopManager.settings.dosingEnabled = sender.isOn
+
+        tableView.reloadRows(
+            at: [
+                IndexPath(row: LoopRow.microbolus.rawValue, section: Section.loop.rawValue)
+            ],
+            with: .none
+        )
     }
 }
 

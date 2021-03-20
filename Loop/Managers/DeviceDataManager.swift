@@ -208,7 +208,8 @@ final class DeviceDataManager {
                 }
                 
                 let report = [
-                    Bundle.main.localizedNameAndVersion,
+                    "## LoopVersion",
+                    "* Version: \(Bundle.main.localizedNameAndVersion)",
                     "* gitRevision: \(Bundle.main.gitRevision ?? "N/A")",
                     "* gitBranch: \(Bundle.main.gitBranch ?? "N/A")",
                     "* sourceRoot: \(Bundle.main.sourceRoot ?? "N/A")",
@@ -418,15 +419,30 @@ extension DeviceDataManager: PumpManagerDelegate {
         }
         lastBLEDrivenUpdate = Date()
 
-        cgmManager?.fetchNewDataIfNeeded { (result) in
-            if case .newData = result {
-                AnalyticsManager.shared.didFetchNewCGMData()
-            }
-
-            if let manager = self.cgmManager {
-                self.queue.async {
-                    self.processCGMResult(manager, result: result)
+        refreshCGM()
+    }
+    
+    private func refreshCGM(_ completion: (() -> Void)? = nil) {
+        if let cgmManager = cgmManager {
+            cgmManager.fetchNewDataIfNeeded { (result) in
+                if case .newData = result {
+                    AnalyticsManager.shared.didFetchNewCGMData()
                 }
+
+                self.queue.async {
+                    self.processCGMResult(cgmManager, result: result)
+                    completion?()
+                }
+            }
+        } else {
+            completion?()
+        }
+    }
+    
+    func refreshDeviceData() {
+        refreshCGM() {
+            self.queue.async {
+                self.pumpManager?.assertCurrentPumpData()
             }
         }
     }
@@ -646,7 +662,11 @@ extension DeviceDataManager: LoopDataManagerDelegate {
             return units
         }
 
-        return pumpManager.roundToSupportedBolusVolume(units: units)
+        let bolusVolumesWithZero = [0] + pumpManager.supportedBolusVolumes
+        let rounded = bolusVolumesWithZero.enumerated().min( by: { abs($0.1 - units) < abs($1.1 - units) } )!.1
+        self.log.default("Rounded \(units) to \(rounded)")
+
+        return rounded
     }
 
     func loopDataManager(
@@ -674,6 +694,15 @@ extension DeviceDataManager: LoopDataManagerDelegate {
             }
         )
     }
+
+    func loopDataManager(_ manager: LoopDataManager, didRecommendMicroBolus bolus: (amount: Double, date: Date), completion: @escaping (_ error: Error?) -> Void) -> Void {
+        enactBolus(
+            units: bolus.amount,
+            at: bolus.date,
+            completion: completion)
+    }
+
+    var pumpStatus: PumpManagerStatus? { pumpManager?.status }
 }
 
 extension Notification.Name {

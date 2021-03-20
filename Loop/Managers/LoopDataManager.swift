@@ -10,6 +10,8 @@ import Foundation
 import HealthKit
 import LoopKit
 import LoopCore
+import Combine
+import Accelerate
 
 
 final class LoopDataManager {
@@ -35,6 +37,12 @@ final class LoopDataManager {
     weak var delegate: LoopDataManagerDelegate?
 
     private let logger: CategoryLogger
+
+    private var loopSubscription: AnyCancellable?
+
+    private var latestGlucoseSamples: [StoredGlucoseSample]?
+
+    let lastMicrobolusEvent = CurrentValueSubject<[Microbolus.Event], Never>([])
 
     // References to registered notification center observers
     private var notificationObservers: [Any] = []
@@ -74,7 +82,8 @@ final class LoopDataManager {
             defaultAbsorptionTimes: LoopSettings.defaultCarbAbsorptionTimes,
             carbRatioSchedule: carbRatioSchedule,
             insulinSensitivitySchedule: insulinSensitivitySchedule,
-            overrideHistory: overrideHistory
+            overrideHistory: overrideHistory,
+            carbAbsorptionModel: settings.carbAbsorptionModel
         )
 
         doseStore = DoseStore(
@@ -229,6 +238,16 @@ final class LoopDataManager {
     fileprivate var recommendedBolus: (recommendation: BolusRecommendation, date: Date)?
 
     fileprivate var carbsOnBoard: CarbValue?
+
+    fileprivate var requiredCarbs: HKQuantity? {
+        didSet {
+            let number = settings.freeAPSSettings.showRequiredCarbsOnAppBadge
+                ? requiredCarbs?.doubleValue(for: .gram()) ?? 0 : 0
+            DispatchQueue.main.async {
+                UIApplication.shared.applicationIconBadgeNumber = Int(number)
+            }
+        }
+    }
 
     var basalDeliveryState: PumpManagerStatus.BasalDeliveryState? {
         get {
@@ -419,6 +438,18 @@ extension LoopDataManager {
     /// The insulin sensitivity schedule, applying recent overrides relative to the current moment in time.
     var insulinSensitivityScheduleApplyingOverrideHistory: InsulinSensitivitySchedule? {
         return carbStore.insulinSensitivityScheduleApplyingOverrideHistory
+    }
+
+    /// The carb sensitivity schedule, applying recent overrides relative to the current moment in time.
+    /// This is measured in <blood glucose>/gram
+    var carbSensitivityScheduleApplyingOverrideHistory: CarbSensitivitySchedule? {
+        guard let crSchedule = carbRatioScheduleApplyingOverrideHistory,
+            let isfSchedule = insulinSensitivityScheduleApplyingOverrideHistory
+        else {
+            return nil
+        }
+
+        return .carbSensitivitySchedule(insulinSensitivitySchedule: isfSchedule, carbRatioSchedule: crSchedule)
     }
 
     /// Sets a new time zone for a the schedule-based settings
@@ -682,41 +713,80 @@ extension LoopDataManager {
     /// Executes an analysis of the current data, and recommends an adjustment to the current
     /// temporary basal rate.
     func loop() {
-        self.dataAccessQueue.async {
-            self.logger.default("Loop running")
-            NotificationCenter.default.post(name: .LoopRunning, object: self)
+        self.logger.default("Loop running")
+        NotificationCenter.default.post(name: .LoopRunning, object: self)
 
-            self.lastLoopError = nil
-            let startDate = Date()
-
-            do {
-                try self.update()
-
-                if self.settings.dosingEnabled {
-                    self.setRecommendedTempBasal { (error) -> Void in
-                        self.lastLoopError = error
-
-                        if let error = error {
-                            self.logger.error(error)
-                        } else {
-                            self.loopDidComplete(date: Date(), duration: -startDate.timeIntervalSinceNow)
-                        }
-                        self.logger.default("Loop ended")
-                        self.notify(forChange: .tempBasal)
-                    }
-
-                    // Delay the notification until we know the result of the temp basal
-                    return
-                } else {
-                    self.loopDidComplete(date: Date(), duration: -startDate.timeIntervalSinceNow)
+        let updatePublisher = Deferred {
+            Future<(), Error> { promise in
+                do {
+                    try self.update()
+                    promise(.success(()))
+                } catch let error {
+                    promise(.failure(error))
                 }
-            } catch let error {
-                self.lastLoopError = error
             }
-
-            self.logger.default("Loop ended")
-            self.notify(forChange: .tempBasal)
         }
+        .subscribe(on: dataAccessQueue)
+        .eraseToAnyPublisher()
+
+        let enactBolusPublisher = Deferred {
+            Future<Microbolus.Event?, Error> { promise in
+                self.calculateAndEnactMicroBolusIfNeeded { event, error in
+                    if let error = error {
+                        promise(.failure(error))
+                    }
+                    promise(.success(event))
+                }
+            }
+        }
+        .subscribe(on: dataAccessQueue)
+        .eraseToAnyPublisher()
+
+        let setBasalPublisher = Deferred {
+            Future<(), Error> { promise in
+                guard self.settings.dosingEnabled else {
+                    return promise(.success(()))
+                }
+
+                self.setRecommendedTempBasal { error in
+                    if let error = error {
+                        promise(.failure(error))
+                    }
+                    promise(.success(()))
+                }
+
+            }
+        }
+        .subscribe(on: dataAccessQueue)
+        .eraseToAnyPublisher()
+
+        loopSubscription?.cancel()
+
+        let startDate = Date()
+        loopSubscription = updatePublisher
+            .flatMap { _ in setBasalPublisher }
+            .flatMap { _ in enactBolusPublisher }
+            .receive(on: dataAccessQueue)
+            .sink(
+                receiveCompletion: { [weak self] completion in
+                    guard let self = self else { return }
+                    switch completion {
+                    case .finished:
+                        self.lastLoopError = nil
+                        self.loopDidComplete(date: Date(), duration: -startDate.timeIntervalSinceNow)
+                        self.notify(forChange: .bolus)
+                    case let .failure(error):
+                        self.lastLoopError = error
+                        self.logger.error(error)
+                    }
+                    self.logger.default("Loop ended")
+                },
+                receiveValue: { [weak self] event in
+                    guard let event = event, let self = self else { return }
+                    self.lastMicrobolusEvent.send(self.lastMicrobolusEvent.value + [event])
+                    self.logger.debug("Microbolus event. \(event.description)")
+                }
+            )
     }
 
     /// - Throws:
@@ -733,6 +803,7 @@ extension LoopDataManager {
         updateGroup.enter()
         glucoseStore.getCachedGlucoseSamples(start: Date(timeIntervalSinceNow: -settings.inputDataRecencyInterval)) { (values) in
             latestGlucoseDate = values.last?.startDate
+            self.latestGlucoseSamples = values
             updateGroup.leave()
         }
         _ = updateGroup.wait(timeout: .distantFuture)
@@ -853,6 +924,8 @@ extension LoopDataManager {
                 throw error
             }
         }
+
+        updateRequiredCarbs()
     }
 
     private func notify(forChange context: LoopUpdateContext) {
@@ -1190,8 +1263,13 @@ extension LoopDataManager {
         let predictedGlucoseIncludingPendingInsulin = try predictGlucose(using: settings.enabledEffects, includingPendingInsulin: true)
         self.predictedGlucoseIncludingPendingInsulin = predictedGlucoseIncludingPendingInsulin
 
+        let useCurrentBasalRateMultiplier = checkCOBforMicrobolus() && checkTempOverrideForMicrobolus()
+        let selectedMaxBasal = useCurrentBasalRateMultiplier
+            ? settings.currentMaximumBasalRatePerHour(date: startDate, basalRates: basalRateScheduleApplyingOverrideHistory)
+            : settings.maximumBasalRatePerHour
+
         guard
-            let maxBasal = settings.maximumBasalRatePerHour,
+            let maxBasal = selectedMaxBasal,
             let glucoseTargetRange = settings.glucoseTargetRangeScheduleApplyingOverrideIfActive,
             let insulinSensitivity = insulinSensitivityScheduleApplyingOverrideHistory,
             let basalRates = basalRateScheduleApplyingOverrideHistory,
@@ -1262,11 +1340,180 @@ extension LoopDataManager {
     }
 
     /// *This method should only be called from the `dataAccessQueue`*
+    private func calculateAndEnactMicroBolusIfNeeded(_ completion: @escaping (_ event: Microbolus.Event?, _ error: Error?) -> Void) {
+        dispatchPrecondition(condition: .onQueue(dataAccessQueue))
+
+        let startDate = Date()
+
+        guard settings.dosingEnabled else {
+            logger.debug("Closed loop is disabled. Cancel microbolus calculation.")
+            completion(nil, nil)
+            return
+        }
+
+        guard let recommendedBolus = recommendedBolus else {
+            logger.debug("No recommended bolus. Cancel microbolus calculation.")
+            completion(nil, nil)
+            return
+        }
+
+        let insulinReq = recommendedBolus.recommendation.amount
+
+        guard insulinReq > 0 else {
+            logger.debug("No microbolus needed.")
+            completion(nil, nil)
+            return
+        }
+
+        guard abs(recommendedBolus.date.timeIntervalSinceNow) < TimeInterval(minutes: 5) else {
+            completion(.canceled(date: startDate, recommended: insulinReq, reason: "Bolus recommendation expired."), nil)
+            return
+        }
+
+        guard let glucose = glucoseStore.latestGlucose,
+            let predictedGlucose = predictedGlucose,
+            let unit = glucoseStore.preferredUnit,
+            let glucoseTargetRange = settings.glucoseTargetRangeScheduleApplyingOverrideIfActive
+        else {
+            completion(.canceled(date: startDate, recommended: insulinReq, reason: "Glucose data not found."), nil)
+            return
+        }
+
+        let glucoseValue = glucose.quantity.doubleValue(for: unit)
+        let previousGlucoseValue = latestGlucoseSamples?.suffix(2).first?.quantity.doubleValue(for: unit) ?? glucoseValue
+        let cutoff = HKQuantity(unit: .millimolesPerLiter, doubleValue: 2.5).doubleValue(for: unit)
+
+        let delta = glucoseValue - previousGlucoseValue
+
+        guard delta <= min(glucoseValue * 0.2, cutoff) else {
+            completion(.canceled(date: startDate, recommended: insulinReq, reason: "Glucose delta is too big. Possible sensor noise or calibration."), nil)
+            return
+        }
+
+        if let sensorState = delegate?.sensorState {
+            guard sensorState.isStateValid || settings.microbolusSettings.enabledWhenSensorStateIsInvalid else {
+                completion(.canceled(date: startDate, recommended: insulinReq, reason: "Possible sensor noise or calibration."), nil)
+                return
+            }
+        } else {
+            guard settings.microbolusSettings.enabledWhenSensorStateIsInvalid else {
+                completion(.canceled(date: startDate, recommended: insulinReq, reason: "No sensor state found."), nil)
+                return
+            }
+        }
+
+        let glucoseBelowRange = predictedGlucose.first { $0.quantity.doubleValue(for: unit) < glucoseTargetRange.value(at: $0.startDate).minValue }
+
+        if !settings.microbolusSettings.allowWhenGlucoseBelowTarget, glucoseBelowRange != nil {
+            let timeFormatter = DateFormatter()
+            timeFormatter.timeStyle = .short
+            completion(.canceled(
+                date: startDate,
+                recommended: insulinReq,
+                reason: "Glucose \(glucoseBelowRange!.quantity) is below target at \(timeFormatter.string(from: glucoseBelowRange!.startDate))"), nil)
+            return
+        }
+
+        guard checkCOBforMicrobolus() else {
+            completion(.canceled(date: startDate, recommended: insulinReq, reason: "Microboluses disabled."), nil)
+            return
+        }
+
+        guard checkTempOverrideForMicrobolus() else {
+            completion(.canceled(date: startDate, recommended: insulinReq, reason: "Canceled by temporary override."), nil)
+            return
+        }
+
+        guard let bolusState = delegate?.pumpStatus?.bolusState, case .none = bolusState else {
+            completion(.canceled(date: startDate, recommended: insulinReq, reason: "Already bolusing."), nil)
+            return
+        }
+
+        let pumpIsActive: Bool = {
+            switch delegate?.pumpStatus?.basalDeliveryState {
+            case .active, .tempBasal: return true
+            default: return false
+            }
+        }()
+
+        guard pumpIsActive else {
+            completion(.canceled(date: startDate, recommended: insulinReq, reason: "Pump suspended or busy."), nil)
+            return
+        }
+
+        guard let threshold = settings.suspendThreshold, glucose.quantity > threshold.quantity else {
+            completion(.canceled(date: startDate, recommended: insulinReq, reason: "Current glucose is below the suspend threshold."), nil)
+            return
+        }
+
+        switch recommendedBolus.recommendation.notice {
+        case .glucoseBelowSuspendThreshold?:
+            completion(.canceled(date: startDate, recommended: insulinReq, reason: "Glucose below suspend threshold"), nil)
+            return
+        case .currentGlucoseBelowTarget? where !settings.microbolusSettings.allowWhenGlucoseBelowTarget,
+             .predictedGlucoseBelowTarget? where !settings.microbolusSettings.allowWhenGlucoseBelowTarget:
+            completion(.canceled(date: startDate, recommended: insulinReq, reason: "Glucose below tagret range"), nil)
+            return
+        default: break
+        }
+
+        let rawBolusUnits = insulinReq * settings.microbolusSettings.partialApplication
+
+        let volumeRounder = { (_ units: Double) in
+            self.delegate?.loopDataManager(self, roundBolusVolume: units) ?? units
+        }
+
+        let microBolusUnits = volumeRounder(rawBolusUnits)
+        
+        guard microBolusUnits > 0 else {
+            completion(.canceled(date: startDate, recommended: insulinReq, reason: "Microbolus < then supported volume."), nil)
+            return
+        }
+        guard microBolusUnits >= settings.microbolusSettings.minimumBolusSize else {
+            completion(.canceled(date: startDate, recommended: insulinReq, reason: "Microbolus < then minimum bolus size."), nil)
+            return
+        }
+
+        let recommendation = (amount: microBolusUnits, date: startDate)
+        logger.debug("Enact microbolus: \(String(describing: microBolusUnits))")
+
+        self.delegate?.loopDataManager(self, didRecommendMicroBolus: recommendation) { error in
+            if let error = error {
+                completion(.failed(date: startDate, recommended: insulinReq, error: error), error)
+            } else {
+                completion(.succeeded(date: startDate, recommended: insulinReq, amount: microBolusUnits, roundedUp: microBolusUnits > rawBolusUnits), nil)
+            }
+        }
+    }
+
+    private func checkCOBforMicrobolus() -> Bool {
+        let cob = carbsOnBoard?.quantity.doubleValue(for: .gram()) ?? 0
+        return (cob > 0 && settings.microbolusSettings.enabled) || (cob == 0 && settings.microbolusSettings.enabledWithoutCarbs)
+    }
+
+    private func checkTempOverrideForMicrobolus() -> Bool {
+        if settings.microbolusSettings.disableByOverride,
+            let unit = glucoseStore.preferredUnit,
+            let override = settings.scheduleOverride,
+            !override.hasFinished(),
+            let overrideLowerBound = override.settings.targetRange?.lowerBound,
+            overrideLowerBound >= HKQuantity(unit: unit, doubleValue: settings.microbolusSettings.overrideLowerBound) {
+            return false
+        }
+        return true
+    }
+
+    /// *This method should only be called from the `dataAccessQueue`*
     private func setRecommendedTempBasal(_ completion: @escaping (_ error: Error?) -> Void) {
         dispatchPrecondition(condition: .onQueue(dataAccessQueue))
 
         guard let recommendedTempBasal = self.recommendedTempBasal else {
             completion(nil)
+            return
+        }
+
+        if case .suspended = basalDeliveryState {
+            completion(LoopError.pumpSuspended)
             return
         }
 
@@ -1286,6 +1533,44 @@ extension LoopDataManager {
                 }
             }
         }
+    }
+
+    func setManualTempBasal(_ recommendation: TempBasalRecommendation) {
+        guard let maxBasal = self.settings.maximumBasalRatePerHour else { return }
+        self.dataAccessQueue.async {
+            let units = min(recommendation.unitsPerHour, maxBasal)
+            let recommendedTempBasal = (
+                recommendation: TempBasalRecommendation(unitsPerHour: units, duration: recommendation.duration),
+                date: Date()
+            )
+            self.delegate?.loopDataManager(self, didRecommendBasalChange: recommendedTempBasal) { (result) in
+                self.dataAccessQueue.async {
+                    self.notify(forChange: .tempBasal)
+                }
+            }
+        }
+    }
+
+    func updateRequiredCarbs() {
+        dispatchPrecondition(condition: .onQueue(dataAccessQueue))
+        guard
+            let unit = glucoseStore.preferredUnit,
+            let predictedGlucose = self.predictedGlucose?.last,
+            let csfSchedule = carbSensitivityScheduleApplyingOverrideHistory,
+            let glucoseTargetRange = settings.glucoseTargetRangeScheduleApplyingOverrideIfActive
+        else {
+            requiredCarbs = nil
+            return
+        }
+        let delta = glucoseTargetRange.minQuantity(at: predictedGlucose.startDate).doubleValue(for: unit)
+            - predictedGlucose.quantity.doubleValue(for: unit)
+        guard delta > 0 else {
+            requiredCarbs = nil
+            return
+        }
+
+        let now = Date()
+        requiredCarbs = HKQuantity(unit: .gram(), doubleValue: delta / csfSchedule.value(at: now))
     }
 }
 
@@ -1493,7 +1778,7 @@ extension LoopDataManager {
 
                 "predictedGlucose: [",
                 "* PredictedGlucoseValue(start, mg/dL)",
-                (state.predictedGlucose ?? []).reduce(into: "", { (entries, entry) in
+                (state.predictedGlucoseIncludingPendingInsulin ?? []).reduce(into: "", { (entries, entry) in
                     entries.append("* \(entry.startDate), \(entry.quantity.doubleValue(for: .milligramsPerDeciliter))\n")
                 }),
                 "]",
@@ -1579,6 +1864,20 @@ protocol LoopDataManagerDelegate: class {
     ///   - units: The recommended bolus in U
     /// - Returns: a supported bolus volume in U. The volume returned should not be larger than the passed in rate.
     func loopDataManager(_ manager: LoopDataManager, roundBolusVolume units: Double) -> Double
+
+    /// Informs the delegate that a micro bolus is recommended
+    ///
+    /// - Parameters:
+    ///   - manager: The manager
+    ///   - bolus: The new recommended micro bolus
+    ///   - completion: A closure called once on completion
+    func loopDataManager(_ manager: LoopDataManager, didRecommendMicroBolus bolus: (amount: Double, date: Date), completion: @escaping (_ error: Error?) -> Void) -> Void
+
+    /// Current pump state
+    var pumpStatus: PumpManagerStatus? { get }
+
+    /// Current sensor state
+    var sensorState: SensorDisplayable? { get }
 }
 
 private extension TemporaryScheduleOverride {

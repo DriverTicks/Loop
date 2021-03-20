@@ -353,8 +353,10 @@ final class StatusTableViewController: ChartsTableViewController {
             if currentContext.contains(.carbs) {
                 reloadGroup.enter()
                 manager.carbStore.getCarbsOnBoardValues(start: startDate, effectVelocities: manager.settings.dynamicCarbAbsorptionEnabled ? state.insulinCounteractionEffects : nil) { (values) in
-                    cobValues = values
-                    reloadGroup.leave()
+                    DispatchQueue.main.async {
+                        cobValues = values
+                        reloadGroup.leave()
+                    }
                 }
             }
 
@@ -364,49 +366,57 @@ final class StatusTableViewController: ChartsTableViewController {
         if currentContext.contains(.glucose) {
             reloadGroup.enter()
             self.deviceManager.loopManager.glucoseStore.getCachedGlucoseSamples(start: startDate) { (values) -> Void in
-                glucoseValues = values
-                reloadGroup.leave()
+                DispatchQueue.main.async {
+                    glucoseValues = values
+                    reloadGroup.leave()
+                }
             }
         }
 
         if currentContext.contains(.insulin) {
             reloadGroup.enter()
             deviceManager.loopManager.doseStore.getInsulinOnBoardValues(start: startDate) { (result) -> Void in
-                switch result {
-                case .failure(let error):
-                    self.log.error("DoseStore failed to get insulin on board values: %{public}@", String(describing: error))
-                    retryContext.update(with: .insulin)
-                    iobValues = []
-                case .success(let values):
-                    iobValues = values
+                DispatchQueue.main.async {
+                    switch result {
+                    case .failure(let error):
+                        self.log.error("DoseStore failed to get insulin on board values: %{public}@", String(describing: error))
+                        retryContext.update(with: .insulin)
+                        iobValues = []
+                    case .success(let values):
+                        iobValues = values
+                    }
+                    reloadGroup.leave()
                 }
-                reloadGroup.leave()
             }
 
             reloadGroup.enter()
             deviceManager.loopManager.doseStore.getNormalizedDoseEntries(start: startDate) { (result) -> Void in
-                switch result {
-                case .failure(let error):
-                    self.log.error("DoseStore failed to get normalized dose entries: %{public}@", String(describing: error))
-                    retryContext.update(with: .insulin)
-                    doseEntries = []
-                case .success(let doses):
-                    doseEntries = doses
+                DispatchQueue.main.async {
+                    switch result {
+                    case .failure(let error):
+                        self.log.error("DoseStore failed to get normalized dose entries: %{public}@", String(describing: error))
+                        retryContext.update(with: .insulin)
+                        doseEntries = []
+                    case .success(let doses):
+                        doseEntries = doses
+                    }
+                    reloadGroup.leave()
                 }
-                reloadGroup.leave()
             }
 
             reloadGroup.enter()
             deviceManager.loopManager.doseStore.getTotalUnitsDelivered(since: Calendar.current.startOfDay(for: Date())) { (result) in
-                switch result {
-                case .failure:
-                    retryContext.update(with: .insulin)
-                    totalDelivery = nil
-                case .success(let total):
-                    totalDelivery = total.value
-                }
+                DispatchQueue.main.async {
+                    switch result {
+                    case .failure:
+                        retryContext.update(with: .insulin)
+                        totalDelivery = nil
+                    case .success(let total):
+                        totalDelivery = total.value
+                    }
 
-                reloadGroup.leave()
+                    reloadGroup.leave()
+                }
             }
         }
 
@@ -1212,6 +1222,9 @@ final class StatusTableViewController: ChartsTableViewController {
 
             let glucoseTapGestureRecognizer = UITapGestureRecognizer(target: self, action: #selector(openCGMApp(_:)))
             hudView.glucoseHUD.addGestureRecognizer(glucoseTapGestureRecognizer)
+
+            let tempBasalTap = UITapGestureRecognizer(target: self, action: #selector(openTempBasalView))
+            hudView.basalRateHUD.addGestureRecognizer(tempBasalTap)
             
             if deviceManager.cgmManager?.appURL != nil {
                 hudView.glucoseHUD.accessibilityHint = NSLocalizedString("Launches CGM app", comment: "Glucose HUD accessibility hint")
@@ -1272,7 +1285,7 @@ final class StatusTableViewController: ChartsTableViewController {
         if error != nil {
             let alertController = UIAlertController(with: error!)
             let manualLoopAction = UIAlertAction(title: NSLocalizedString("Retry", comment: "The button text for attempting a manual loop"), style: .default, handler: { _ in
-                self.deviceManager.loopManager.loop()
+                self.deviceManager.refreshDeviceData()
             })
             alertController.addAction(manualLoopAction)
             present(alertController, animated: true)
@@ -1298,6 +1311,17 @@ final class StatusTableViewController: ChartsTableViewController {
             case .openAppURL(let url):
                 UIApplication.shared.open(url)
             }
+        }
+    }
+
+    @objc private func openTempBasalView() {
+        guard !deviceManager.loopManager.settings.dosingEnabled else { return }
+        let vc = TempBasalViewController()
+        present(vc, animated: true, completion: nil)
+        vc.onChange = { [weak self] recommendation in
+            vc.dismiss(animated: true, completion: nil)
+            guard let self = self, let recommendation = recommendation else { return }
+            self.deviceManager.loopManager.setManualTempBasal(recommendation)
         }
     }
 

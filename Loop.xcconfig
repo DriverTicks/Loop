@@ -17,4 +17,3 @@ APPICON_NAME = AppIcon
 
 // Optional workspace configuration overrides
 #include? "../LoopConfigOverride.xcconfig"
-
