@@ -241,10 +241,15 @@ final class LoopDataManager {
 
     fileprivate var requiredCarbs: HKQuantity? {
         didSet {
-            let number = settings.freeAPSSettings.showRequiredCarbsOnAppBadge
-                ? requiredCarbs?.doubleValue(for: .gram()) ?? 0 : 0
-            DispatchQueue.main.async {
-                UIApplication.shared.applicationIconBadgeNumber = Int(number)
+            if settings.freeAPSSettings.showRequiredCarbsOnAppBadge {
+                let number = requiredCarbs?.doubleValue(for: .gram()) ?? 0
+                DispatchQueue.main.async {
+                    UIApplication.shared.applicationIconBadgeNumber = Int(number)
+                }
+            } else {
+                DispatchQueue.main.async {
+                    UIApplication.shared.applicationIconBadgeNumber = 0
+                }
             }
         }
     }
@@ -353,6 +358,7 @@ extension LoopDataManager {
             doseStore.basalProfile = newValue
             UserDefaults.appGroup?.basalRateSchedule = newValue
             notify(forChange: .preferences)
+            notifyUpload(forChange: .preferences)
 
             if let newValue = newValue, let oldValue = doseStore.basalProfile, newValue.items != oldValue.items {
                 AnalyticsManager.shared.didChangeBasalRateSchedule()
@@ -380,6 +386,7 @@ extension LoopDataManager {
             carbsOnBoard = nil
 
             notify(forChange: .preferences)
+            notifyUpload(forChange: .preferences)
         }
     }
 
@@ -431,6 +438,7 @@ extension LoopDataManager {
                 self.insulinEffect = nil
 
                 self.notify(forChange: .preferences)
+                self.notifyUpload(forChange: .preferences)
             }
         }
     }
@@ -930,6 +938,15 @@ extension LoopDataManager {
 
     private func notify(forChange context: LoopUpdateContext) {
         NotificationCenter.default.post(name: .LoopDataUpdated,
+            object: self,
+            userInfo: [
+                type(of: self).LoopUpdateContextKey: context.rawValue
+            ]
+        )
+    }
+    
+    private func notifyUpload(forChange context: LoopUpdateContext) {
+        NotificationCenter.default.post(name: .LoopDataUpload,
             object: self,
             userInfo: [
                 type(of: self).LoopUpdateContextKey: context.rawValue
@@ -1836,6 +1853,7 @@ extension LoopDataManager {
 
 extension Notification.Name {
     static let LoopDataUpdated = Notification.Name(rawValue: "com.loopkit.Loop.LoopDataUpdated")
+    static let LoopDataUpload = Notification.Name(rawValue: "com.loopkit.Loop.LoopDataUpload")
     static let LoopRunning = Notification.Name(rawValue: "com.loopkit.Loop.LoopRunning")
     static let LoopCompleted = Notification.Name(rawValue: "com.loopkit.Loop.LoopCompleted")
 }
